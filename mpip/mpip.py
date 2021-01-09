@@ -1,12 +1,7 @@
-import tempfile
 import os
 import subprocess
 import sys
-from contextlib import contextmanager
-from io import TextIOWrapper
-from os import PathLike
 from pathlib import Path
-from typing import Union, TextIO
 
 import fire
 import rich
@@ -17,7 +12,6 @@ REQUIREMENTS_FILE = os.path.join(os.getcwd(), "requirements.txt")
 DEFAULTS = {
     "requirements": REQUIREMENTS_FILE,
     "quiet": False,
-    "output": "stderr",
 }
 
 
@@ -25,7 +19,6 @@ def process_short_flags(params: dict) -> dict:
     short_flags_map = {
         "r": "requirements",
         "q": "quiet",
-        "o": "output",
         "y": "yes",
     }
     for short_flag, long_flag in short_flags_map.items():
@@ -75,61 +68,13 @@ def validate_requirements(params: dict) -> dict:
     return params
 
 
-def validate_output(params: dict) -> dict:
-    output_getter_mapping = {
-        "stderr": lambda x: sys.stderr,
-        "stdout": lambda x: sys.stdout,
-    }
-    output = str(params["output"])
-    params["output"] = output_getter_mapping.get(output, lambda x: Path(output))(output)
-    return params
-
-
-@contextmanager
-def maybe_open_file(maybe_path: Union[PathLike, TextIOWrapper, TextIO]):
-    did_open = False
-    if isinstance(maybe_path, (TextIOWrapper, tempfile.TemporaryFile().__class__)):
-        yield maybe_path
-    else:
-        try:
-            f = open(maybe_path, "w")
-            did_open = True
-            yield f
-        finally:
-            if did_open:
-                f.close()
-
-
-def rprint(content, file):
-    if isinstance(file, tempfile.TemporaryFile().__class__):
-        # for when "quiet" flag is enabled
-        return
-    with maybe_open_file(file) as f:
-        rich.print(content, file=f)
-
-
 def name_from_req(requirement):
     name = f'{requirement.name}[{",".join(requirement.extras)}]' if requirement.extras else requirement.name
     return name.lower()
 
 
-def run(*args, stdout=sys.stdout, stderr=sys.stderr):
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    out, err = proc.communicate()
-    with maybe_open_file(stdout) as stdout:
-        with maybe_open_file(stderr) as stderr:
-            # Some file descriptors want bytes and others want strings.
-            # Most runs will use stdout, stderr which wants strings.
-            try:
-                [stdout.write(out.decode()), stderr.write(err.decode()), stdout.flush(), stderr.flush()]
-            except TypeError:
-                # needed with --quiet flag
-                [stdout.write(out), stderr.write(err), stdout.flush(), stderr.flush()]
-            return proc.returncode
-
-
-@execution_pipeline(pre=[process_short_flags, get_defaults, validate_requirements, validate_output, validate_command])
-def mpip(command, *args, quiet=False, requirements=None, output=None, yes=False, **kwargs):
+@execution_pipeline(pre=[process_short_flags, get_defaults, validate_requirements, validate_command])
+def mpip(command, *args, quiet=False, requirements=None, yes=False, **kwargs):
     """
     mpip
 
@@ -145,20 +90,21 @@ def mpip(command, *args, quiet=False, requirements=None, output=None, yes=False,
 
     :param quiet: Whether to output information to the file specified by the `output` parameter. Defaults to False
     :param requirements: Path to your requirements.txt file. Defaults to `./requirements.txt`.
-    :param output: File path to output text from the script. Defaults to stderr, and stdout is a valid option.
     :param yes: Confirm without prompting for user input.
     """
+    stdout, stderr = sys.stdout, sys.stderr
     if quiet:
-        output, yes = tempfile.TemporaryFile(), True
+        yes, stdout, stderr = True, subprocess.PIPE, subprocess.PIPE
     if not requirements.exists():
-        rprint(f"[bold cyan]Creating new `requirements.txt` file at `{requirements}`.[/bold cyan]", file=output)
+        if not quiet:
+            rich.print(f"[bold cyan]Creating new `requirements.txt` file at `{requirements}`.[/bold cyan]")
         with open(requirements, "w"):
             pass
 
     y = ("-y",) if yes and command == "uninstall" else ()
-    res = run("pip", command, *y, *args, stdout=output, stderr=output)
-    if not res == 0:
-        rprint(f"[red]ERROR: Command failed; not modifying `requirements.txt`.[/red]", file=output)
+    res = subprocess.run(["pip", command, *y, *args], stdout=stdout, stderr=stderr)
+    if not res.returncode == 0:
+        rich.print(f"[red]ERROR: Command failed; not modifying `requirements.txt`.[/red]")
         exit(1)
 
     adjusted_requirements = {}
